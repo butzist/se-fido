@@ -218,3 +218,98 @@ pub enum PresenceError {
 pub trait UserPresence {
     fn request(&mut self, req: &PresenceRequest) -> Result<Presence, PresenceError>;
 }
+
+/// Async counterpart of [`Backend`].
+///
+/// Existing synchronous backends get this trait through a blanket adapter.
+#[allow(async_fn_in_trait)]
+pub trait AsyncBackend {
+    async fn random(&mut self, out: &mut [u8]);
+    async fn create_key(
+        &mut self,
+        rp_id: &str,
+        user_id: &[u8],
+        uv: UvPolicy,
+    ) -> Result<NewKey, BackendError>;
+    async fn sign(&mut self, handle: &[u8], message: &[u8]) -> Result<Vec<u8>, BackendError>;
+    async fn delete_key(&mut self, handle: &[u8]) -> Result<(), BackendError>;
+}
+
+impl<T: Backend> AsyncBackend for T {
+    async fn random(&mut self, out: &mut [u8]) {
+        self.random(out)
+    }
+
+    async fn create_key(
+        &mut self,
+        rp_id: &str,
+        user_id: &[u8],
+        uv: UvPolicy,
+    ) -> Result<NewKey, BackendError> {
+        self.create_key(rp_id, user_id, uv)
+    }
+
+    async fn sign(&mut self, handle: &[u8], message: &[u8]) -> Result<Vec<u8>, BackendError> {
+        self.sign(handle, message)
+    }
+
+    async fn delete_key(&mut self, handle: &[u8]) -> Result<(), BackendError> {
+        self.delete_key(handle)
+    }
+}
+
+/// Async counterpart of [`CredentialStore`].
+///
+/// Existing synchronous stores get this trait through a blanket adapter.
+#[allow(async_fn_in_trait)]
+pub trait AsyncCredentialStore {
+    async fn get(&self, id: &[u8]) -> Result<Option<Arc<Credential>>, StoreError>;
+    async fn list_rp(&self, rp_id: &str) -> Result<Vec<Arc<Credential>>, StoreError>;
+    async fn insert(&mut self, cred: Arc<Credential>) -> Result<(), StoreError>;
+    async fn remove(&mut self, id: &[u8]) -> Result<Option<Arc<Credential>>, StoreError>;
+    async fn clear(&mut self) -> Result<Vec<Arc<Credential>>, StoreError>;
+    async fn next_sign_count(&mut self) -> Result<u32, StoreError>;
+}
+
+impl<T: CredentialStore> AsyncCredentialStore for T {
+    async fn get(&self, id: &[u8]) -> Result<Option<Arc<Credential>>, StoreError> {
+        self.get(id)
+    }
+
+    async fn list_rp(&self, rp_id: &str) -> Result<Vec<Arc<Credential>>, StoreError> {
+        self.list_rp(rp_id)
+    }
+
+    async fn insert(&mut self, cred: Arc<Credential>) -> Result<(), StoreError> {
+        self.insert(cred)
+    }
+
+    async fn remove(&mut self, id: &[u8]) -> Result<Option<Arc<Credential>>, StoreError> {
+        self.remove(id)
+    }
+
+    async fn clear(&mut self) -> Result<Vec<Arc<Credential>>, StoreError> {
+        self.clear()
+    }
+
+    async fn next_sign_count(&mut self) -> Result<u32, StoreError> {
+        self.next_sign_count()
+    }
+}
+
+/// Async counterpart of [`UserPresence`].
+///
+/// Implementations that already have a synchronous presence source get this
+/// trait through a blanket adapter. Async presence is useful when the answer
+/// arrives through an event or a peripheral, but a transport must still send
+/// KEEPALIVE responses while this future is pending.
+#[allow(async_fn_in_trait)]
+pub trait AsyncUserPresence {
+    async fn request(&mut self, req: &PresenceRequest) -> Result<Presence, PresenceError>;
+}
+
+impl<T: UserPresence> AsyncUserPresence for T {
+    async fn request(&mut self, req: &PresenceRequest) -> Result<Presence, PresenceError> {
+        self.request(req)
+    }
+}

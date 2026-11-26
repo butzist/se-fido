@@ -1,0 +1,893 @@
+//! Async variant of the CTAP2 authenticator.
+//!
+//! [`AsyncAuthenticator`] mirrors [`super::Authenticator`] but awaits the
+//! async backend, store, and presence traits. The synchronous API is unchanged.
+
+use super::authenticator::{AttestationFormat, AuthenticatorConfig, NEXT_ASSERTION_TIMEOUT_MS};
+use crate::authdata::{self, AttestedCredential, FLAG_UP, FLAG_UV};
+use crate::bytes::{Bytes, Text};
+use crate::cbor::{decode, encode, Out, Value};
+use crate::der;
+use crate::types::*;
+use crate::{command, Status, COSE_ALG_ES256};
+use alloc::sync::Arc;
+use alloc::vec;
+use alloc::vec::Vec;
+use p256::ecdsa::signature::Verifier;
+use p256::ecdsa::VerifyingKey;
+use p256::elliptic_curve::sec1::ToEncodedPoint;
+
+const MAX_USER_ID_LEN: usize = 64;
+/// Names are truncated to this many bytes (allowed by the spec).
+const MAX_NAME_LEN: usize = 64;
+
+struct Pending {
+    rp_id: Text,
+    client_data_hash: Bytes,
+    flags: u8,
+    user_verified: bool,
+    remaining: Vec<Arc<Credential>>,
+    started_ms: u64,
+}
+
+/// Async CTAP2 authenticator state machine.
+pub struct AsyncAuthenticator<B, S, P> {
+    backend: B,
+    store: S,
+    presence: P,
+    config: AuthenticatorConfig,
+    pending: Option<Pending>,
+}
+
+#[derive(Default)]
+struct Options {
+    rk: Option<bool>,
+    up: Option<bool>,
+    uv: Option<bool>,
+}
+
+fn parse_options(v: Option<&Value>) -> Result<Options, Status> {
+    let mut o = Options::default();
+    let Some(v) = v else { return Ok(o) };
+    for (k, val) in v.as_map()? {
+        let Value::Text(k) = k else { continue };
+        match k.as_str() {
+            "rk" => o.rk = Some(val.as_bool()?),
+            "up" => o.up = Some(val.as_bool()?),
+            "uv" => o.uv = Some(val.as_bool()?),
+            _ => {}
+        }
+    }
+    Ok(o)
+}
+
+/// IDs of "public-key" descriptors; other types are skipped.
+fn parse_descriptors(v: &Value) -> Result<Vec<Bytes>, Status> {
+    let mut ids = Vec::new();
+    for d in v.as_array()? {
+        d.as_map()?;
+        let ty = d
+            .get_text("type")
+            .ok_or(Status::MissingParameter)?
+            .as_text()?;
+        let id = d
+            .get_text("id")
+            .ok_or(Status::MissingParameter)?
+            .as_bytes()?;
+        if ty.as_str() == "public-key" {
+            ids.push(id.clone());
+        }
+    }
+    Ok(ids)
+}
+
+fn optional_text(m: &Value, key: &str) -> Result<Option<Text>, Status> {
+    match m.get_text(key) {
+        None => Ok(None),
+        Some(v) => Ok(Some(v.as_text()?.truncated(MAX_NAME_LEN))),
+    }
+}
+
+fn required_map(v: Option<&Value>) -> Result<&Value, Status> {
+    let v = v.ok_or(Status::MissingParameter)?;
+    v.as_map()?;
+    Ok(v)
+}
+
+fn store_err(e: StoreError) -> Status {
+    match e {
+        StoreError::Full => Status::KeyStoreFull,
+        _ => Status::Other,
+    }
+}
+
+fn backend_err(e: BackendError) -> Status {
+    match e {
+        BackendError::KeyNotFound => Status::InvalidCredential,
+        BackendError::Cancelled => Status::OperationDenied,
+        BackendError::Failed(_) => Status::Other,
+    }
+}
+
+impl<B: AsyncBackend, S: AsyncCredentialStore, P: AsyncUserPresence> AsyncAuthenticator<B, S, P> {
+    pub fn new(backend: B, store: S, presence: P, config: AuthenticatorConfig) -> Self {
+        AsyncAuthenticator {
+            backend,
+            store,
+            presence,
+            config,
+            pending: None,
+        }
+    }
+
+    pub fn backend(&self) -> &B {
+        &self.backend
+    }
+    pub fn store(&self) -> &S {
+        &self.store
+    }
+    pub fn presence(&self) -> &P {
+        &self.presence
+    }
+    pub fn presence_mut(&mut self) -> &mut P {
+        &mut self.presence
+    }
+    pub fn config(&self) -> &AuthenticatorConfig {
+        &self.config
+    }
+
+    /// Handle one request (command byte + CBOR); returns status + CBOR.
+    pub async fn process(&mut self, request: &Bytes, now_ms: u64) -> Vec<u8> {
+        match self.dispatch(request, now_ms).await {
+            Ok(body) => {
+                let mut out = Vec::with_capacity(1 + body.len());
+                out.push(Status::Ok.code());
+                out.extend_from_slice(&body);
+                out
+            }
+            Err(s) => vec![s.code()],
+        }
+    }
+
+    async fn dispatch(&mut self, request: &Bytes, now_ms: u64) -> Result<Vec<u8>, Status> {
+        let &cmd = request.first().ok_or(Status::InvalidLength)?;
+        let params = request
+            .slice(1..request.len())
+            .ok_or(Status::InvalidLength)?;
+        if cmd != command::GET_NEXT_ASSERTION {
+            self.pending = None;
+        }
+        match cmd {
+            command::GET_INFO => Ok(self.get_info()),
+            command::MAKE_CREDENTIAL => self.make_credential(&parse_params(&params)?).await,
+            command::GET_ASSERTION => self.get_assertion(&parse_params(&params)?, now_ms).await,
+            command::GET_NEXT_ASSERTION => self.get_next_assertion(now_ms).await,
+            command::RESET => self.reset().await.map(|_| Vec::new()),
+            command::SELECTION => self
+                .ask(PresenceKind::Selection, None, None, false)
+                .await
+                .map(|_| Vec::new()),
+            // clientPin and anything else: not implemented.
+            _ => Err(Status::InvalidCommand),
+        }
+    }
+
+    fn get_info(&self) -> Vec<u8> {
+        let mut options = vec![
+            (Out::Text("rk"), Out::Bool(true)),
+            (Out::Text("up"), Out::Bool(true)),
+            (Out::Text("plat"), Out::Bool(false)),
+        ];
+        if self.config.advertises_uv() {
+            options.push((Out::Text("uv"), Out::Bool(true)));
+        }
+        let mut versions = vec![Out::Text("FIDO_2_0")];
+        if self.config.advertise_fido21 {
+            versions.push(Out::Text("FIDO_2_1"));
+        }
+        let mut map = vec![
+            (Out::Int(0x01), Out::Array(versions)),
+            (Out::Int(0x03), Out::Bytes(&self.config.aaguid)),
+            (Out::Int(0x04), Out::Map(options)),
+            (Out::Int(0x05), Out::Int(self.config.max_msg_size as i64)),
+            (Out::Int(0x09), Out::Array(vec![Out::Text("usb")])),
+            (
+                Out::Int(0x0a),
+                Out::Array(vec![Out::Map(vec![
+                    (Out::Text("alg"), Out::Int(COSE_ALG_ES256)),
+                    (Out::Text("type"), Out::Text("public-key")),
+                ])]),
+            ),
+        ];
+        if self.config.advertise_cred_protect {
+            // 0x02: supported extensions.
+            map.insert(
+                1,
+                (Out::Int(0x02), Out::Array(vec![Out::Text("credProtect")])),
+            );
+        }
+        // No clientPin: omit pinUvAuthProtocols (0x06).
+        encode(&Out::Map(map))
+    }
+
+    async fn ask(
+        &mut self,
+        kind: PresenceKind,
+        rp_id: Option<&Text>,
+        user_name: Option<&Text>,
+        require_uv: bool,
+    ) -> Result<Presence, Status> {
+        self.ask_with_policy(kind, rp_id, user_name, require_uv, None)
+            .await
+    }
+
+    async fn ask_with_policy(
+        &mut self,
+        kind: PresenceKind,
+        rp_id: Option<&Text>,
+        user_name: Option<&Text>,
+        require_uv: bool,
+        key_uv_policy: Option<UvPolicy>,
+    ) -> Result<Presence, Status> {
+        let req = PresenceRequest {
+            kind,
+            rp_id: rp_id.cloned(),
+            user_name: user_name.cloned(),
+            require_uv,
+            key_uv_policy,
+        };
+        let p = self.presence.request(&req).await.map_err(|e| match e {
+            PresenceError::Denied | PresenceError::UvFailed => Status::OperationDenied,
+            PresenceError::Cancelled => Status::KeepaliveCancel,
+            PresenceError::Timeout => Status::UserActionTimeout,
+        })?;
+        if require_uv && !p.user_verified {
+            return Err(Status::OperationDenied);
+        }
+        Ok(p)
+    }
+
+    /// No PIN/UV auth protocol is implemented. A zero-length pinUvAuthParam
+    /// (platform "touch to select" probe) collects presence then answers
+    /// PIN_NOT_SET; any other value is rejected.
+    async fn pin_uv_auth(
+        &mut self,
+        m: &Value,
+        param_key: i64,
+        proto_key: i64,
+        rp_id: &Text,
+    ) -> Result<(), Status> {
+        let Some(p) = m.get(param_key) else {
+            return Ok(());
+        };
+        if p.as_bytes()?.is_empty() {
+            self.ask(PresenceKind::Probe, Some(rp_id), None, false)
+                .await?;
+            return Err(Status::PinNotSet);
+        }
+        if m.get(proto_key).is_none() {
+            return Err(Status::MissingParameter);
+        }
+        Err(Status::InvalidParameter)
+    }
+
+    /// Sign and verify against the stored public key before releasing.
+    async fn sign_checked(&mut self, cred: &Credential, msg: &[u8]) -> Result<Vec<u8>, Status> {
+        let sig = self
+            .backend
+            .sign(&cred.key_handle, msg)
+            .await
+            .map_err(backend_err)?;
+        let vk = VerifyingKey::from_sec1_bytes(&cred.public_key).map_err(|_| Status::Other)?;
+        let parsed = der::decode(&sig).ok_or(Status::Other)?;
+        vk.verify(msg, &parsed).map_err(|_| Status::Other)?;
+        Ok(sig)
+    }
+
+    async fn make_credential(&mut self, m: &Value) -> Result<Vec<u8>, Status> {
+        let client_data_hash = m
+            .get(0x01)
+            .ok_or(Status::MissingParameter)?
+            .as_bytes()?
+            .clone();
+        let rp = required_map(m.get(0x02))?;
+        let rp_id = rp
+            .get_text("id")
+            .ok_or(Status::MissingParameter)?
+            .as_text()?
+            .clone();
+        let rp_name = optional_text(rp, "name")?;
+        let user = required_map(m.get(0x03))?;
+        let user_id = user
+            .get_text("id")
+            .ok_or(Status::MissingParameter)?
+            .as_bytes()?
+            .clone();
+        let user_name = optional_text(user, "name")?;
+        let user_display_name = optional_text(user, "displayName")?;
+        let cred_params = m.get(0x04).ok_or(Status::MissingParameter)?.as_array()?;
+
+        self.pin_uv_auth(m, 0x08, 0x09, &rp_id).await?;
+
+        if user_id.len() > MAX_USER_ID_LEN {
+            return Err(Status::InvalidLength);
+        }
+        let mut es256 = false;
+        for p in cred_params {
+            p.as_map()?;
+            let ty = p
+                .get_text("type")
+                .ok_or(Status::MissingParameter)?
+                .as_text()?;
+            let alg = p
+                .get_text("alg")
+                .ok_or(Status::MissingParameter)?
+                .as_int()?;
+            if ty.as_str() == "public-key" && alg == COSE_ALG_ES256 as i128 {
+                es256 = true;
+            }
+        }
+        if !es256 {
+            return Err(Status::UnsupportedAlgorithm);
+        }
+        let exclude = match m.get(0x05) {
+            Some(v) => parse_descriptors(v)?,
+            None => Vec::new(),
+        };
+        let cred_protect = if let Some(ext) = m.get(0x06) {
+            ext.as_map()?;
+            match ext.get_text("credProtect") {
+                Some(value) => {
+                    let level = value.as_int()?;
+                    if !(1..=3).contains(&level) {
+                        return Err(Status::InvalidParameter);
+                    }
+                    Some(level as u8)
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
+        let opts = parse_options(m.get(0x07))?;
+        if m.get(0x0a).is_some() {
+            return Err(Status::InvalidParameter); // enterprise attestation
+        }
+        if opts.up == Some(false) {
+            return Err(Status::InvalidOption);
+        }
+        let want_uv = opts.uv == Some(true);
+        if want_uv && !self.config.advertises_uv() {
+            return Err(Status::UnsupportedOption);
+        }
+        let rk = opts.rk == Some(true);
+
+        for id in &exclude {
+            let hit = self
+                .store
+                .get(id)
+                .await
+                .map_err(store_err)?
+                .is_some_and(|c| c.rp_id == rp_id);
+            if hit {
+                if let Err(Status::KeepaliveCancel) = self
+                    .ask(PresenceKind::Excluded, Some(&rp_id), None, false)
+                    .await
+                {
+                    return Err(Status::KeepaliveCancel);
+                }
+                return Err(Status::CredentialExcluded);
+            }
+        }
+
+        let policy = self.config.default_uv_policy;
+        // Platform asked for UV but this authenticator's default policy cannot.
+        if want_uv && !policy.supports_uv() {
+            return Err(Status::UnsupportedOption);
+        }
+        // credProtect level 3 needs UV for every assertion. Without a UV-capable
+        // policy, create the credential at level 2 and echo that level.
+        let cred_protect = match cred_protect {
+            Some(3) if !policy.supports_uv() => Some(2),
+            level => level,
+        };
+        let presence = self
+            .ask(
+                PresenceKind::MakeCredential,
+                Some(&rp_id),
+                user_name.as_ref(),
+                want_uv && policy.supports_uv(),
+            )
+            .await?;
+        let mut flags = FLAG_UP;
+        // UV bit only when the credential policy can enforce UV and presence agreed.
+        if policy.supports_uv() && presence.user_verified {
+            flags |= FLAG_UV;
+        }
+
+        let key = self
+            .backend
+            .create_key(rp_id.as_str(), &user_id, policy)
+            .await
+            .map_err(backend_err)?;
+        let mut random_id = [0u8; CREDENTIAL_ID_LEN];
+        self.backend.random(&mut random_id).await;
+        let mut cred_id = Vec::with_capacity(CREDENTIAL_ID_LEN + 5);
+        if let Some(level) = cred_protect {
+            cred_id.extend_from_slice(b"SFCP");
+            cred_id.push(level);
+        }
+        cred_id.extend_from_slice(&random_id);
+        let counter = match self.store.next_sign_count().await {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = self.backend.delete_key(&key.handle).await;
+                return Err(store_err(e));
+            }
+        };
+        let cred = Arc::new(Credential {
+            id: Bytes::copy_from_slice(&cred_id),
+            rp_id: rp_id.clone(),
+            rp_name,
+            user_id: user_id.clone(),
+            user_name,
+            user_display_name,
+            key_handle: key.handle.clone(),
+            public_key: Bytes::copy_from_slice(key.public_key.to_encoded_point(false).as_bytes()),
+            discoverable: rk,
+            created: counter as u64,
+            uv_policy: policy,
+        });
+
+        let cose = authdata::cose_key(&key.public_key);
+        let extensions = cred_protect.map(|level| {
+            encode(&Out::Map(vec![(
+                Out::Text("credProtect"),
+                Out::Int(level as i64),
+            )]))
+        });
+        let auth_data = authdata::build(
+            rp_id.as_str(),
+            flags,
+            counter,
+            Some(&AttestedCredential {
+                aaguid: &self.config.aaguid,
+                credential_id: &cred_id,
+                cose_key: &cose,
+            }),
+            extensions.as_deref(),
+        );
+        let sig = match self.config.attestation {
+            AttestationFormat::None => None,
+            AttestationFormat::PackedSelf => {
+                let mut msg = auth_data.clone();
+                msg.extend_from_slice(&client_data_hash);
+                match self.sign_checked(&cred, &msg).await {
+                    Ok(sig) => Some(sig),
+                    Err(e) => {
+                        let _ = self.backend.delete_key(&key.handle).await;
+                        return Err(e);
+                    }
+                }
+            }
+        };
+
+        // A resident credential for the same RP and user replaces the old one.
+        let replaced: Vec<Arc<Credential>> = if rk {
+            self.store
+                .list_rp(rp_id.as_str())
+                .await
+                .map_err(store_err)?
+                .into_iter()
+                .filter(|c| c.discoverable && c.user_id == user_id)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        if let Err(e) = self.store.insert(cred).await {
+            let _ = self.backend.delete_key(&key.handle).await;
+            return Err(store_err(e));
+        }
+        for old in replaced {
+            let _ = self.store.remove(&old.id).await;
+            let _ = self.backend.delete_key(&old.key_handle).await;
+        }
+
+        let (fmt, att_stmt) = match &sig {
+            None => ("none", Out::Map(Vec::new())),
+            Some(sig) => (
+                "packed",
+                Out::Map(vec![
+                    (Out::Text("alg"), Out::Int(COSE_ALG_ES256)),
+                    (Out::Text("sig"), Out::Bytes(sig)),
+                ]),
+            ),
+        };
+        Ok(encode(&Out::Map(vec![
+            (Out::Int(0x01), Out::Text(fmt)),
+            (Out::Int(0x02), Out::Bytes(&auth_data)),
+            (Out::Int(0x03), att_stmt),
+        ])))
+    }
+
+    async fn assertion(
+        &mut self,
+        rp_id: &Text,
+        client_data_hash: &[u8],
+        flags: u8,
+        user_verified: bool,
+        cred: &Credential,
+        total: Option<usize>,
+    ) -> Result<Vec<u8>, Status> {
+        let counter = self.store.next_sign_count().await.map_err(store_err)?;
+        let auth_data = authdata::build(rp_id.as_str(), flags, counter, None, None);
+        let mut msg = auth_data.clone();
+        msg.extend_from_slice(client_data_hash);
+        let sig = self.sign_checked(cred, &msg).await?;
+        let mut entries = vec![
+            (
+                Out::Int(0x01),
+                Out::Map(vec![
+                    (Out::Text("id"), Out::Bytes(&cred.id)),
+                    (Out::Text("type"), Out::Text("public-key")),
+                ]),
+            ),
+            (Out::Int(0x02), Out::Bytes(&auth_data)),
+            (Out::Int(0x03), Out::Bytes(&sig)),
+        ];
+        if cred.discoverable {
+            let mut user = vec![(Out::Text("id"), Out::Bytes(&cred.user_id))];
+            // Identifying information only after user verification.
+            if user_verified {
+                if let Some(n) = &cred.user_name {
+                    user.push((Out::Text("name"), Out::Text(n.as_str())));
+                }
+                if let Some(n) = &cred.user_display_name {
+                    user.push((Out::Text("displayName"), Out::Text(n.as_str())));
+                }
+            }
+            entries.push((Out::Int(0x04), Out::Map(user)));
+        }
+        if let Some(n) = total {
+            entries.push((Out::Int(0x05), Out::Int(n as i64)));
+        }
+        Ok(encode(&Out::Map(entries)))
+    }
+
+    async fn get_assertion(&mut self, m: &Value, now_ms: u64) -> Result<Vec<u8>, Status> {
+        let rp_id = m
+            .get(0x01)
+            .ok_or(Status::MissingParameter)?
+            .as_text()?
+            .clone();
+        let client_data_hash = m
+            .get(0x02)
+            .ok_or(Status::MissingParameter)?
+            .as_bytes()?
+            .clone();
+        self.pin_uv_auth(m, 0x06, 0x07, &rp_id).await?;
+        let allow = match m.get(0x03) {
+            Some(v) => parse_descriptors(v)?,
+            None => Vec::new(),
+        };
+        if let Some(ext) = m.get(0x04) {
+            ext.as_map()?;
+        }
+        let opts = parse_options(m.get(0x05))?;
+        if opts.rk.is_some() {
+            return Err(Status::UnsupportedOption);
+        }
+        let want_up = opts.up.unwrap_or(true);
+        let want_uv = opts.uv == Some(true);
+        if want_uv && !self.config.advertises_uv() {
+            return Err(Status::UnsupportedOption);
+        }
+
+        let using_allow_list = !allow.is_empty();
+        // Deliberate policy beyond CTAP 2.1: a silent request (up=false, no uv)
+        // may only check credentials named in an allow list, so discoverable
+        // credentials are never enumerated without the user.
+        if !using_allow_list && !want_up && !want_uv {
+            return Err(Status::NotAllowed);
+        }
+        let mut creds: Vec<Arc<Credential>> = Vec::new();
+        if using_allow_list {
+            for id in &allow {
+                if let Some(c) = self.store.get(id).await.map_err(store_err)? {
+                    if c.rp_id == rp_id && !creds.iter().any(|x| x.id == c.id) {
+                        creds.push(c);
+                    }
+                }
+            }
+        } else {
+            creds = self
+                .store
+                .list_rp(rp_id.as_str())
+                .await
+                .map_err(store_err)?
+                .into_iter()
+                .filter(|c| c.discoverable)
+                .collect();
+            creds.sort_by_key(|c| core::cmp::Reverse(c.created));
+        }
+
+        let key_uv_policy = if creds.is_empty() {
+            None
+        } else if creds.iter().any(|cred| !cred.uv_policy.supports_uv()) {
+            Some(UvPolicy::None)
+        } else {
+            Some(creds[0].uv_policy)
+        };
+        let mut flags = 0u8;
+        let mut user_verified = false;
+        if want_up || want_uv {
+            // Missing keys and any None-policy key require explicit presence.
+            let p = self
+                .ask_with_policy(
+                    PresenceKind::GetAssertion,
+                    Some(&rp_id),
+                    None,
+                    want_uv,
+                    key_uv_policy,
+                )
+                .await?;
+            if want_up {
+                flags |= FLAG_UP;
+            }
+            user_verified = p.user_verified;
+        }
+        creds.retain(|cred| {
+            let verified = user_verified && cred.uv_policy.supports_uv();
+            (!want_uv || verified) && cred.allows_assertion(using_allow_list, verified)
+        });
+        if creds.is_empty() {
+            return Err(Status::NoCredentials);
+        }
+        let first = creds.remove(0);
+        let first_verified = user_verified && first.uv_policy.supports_uv();
+        if first_verified {
+            flags |= FLAG_UV;
+        }
+        let total = if !using_allow_list && !creds.is_empty() {
+            Some(creds.len() + 1)
+        } else {
+            None
+        };
+        let out = self
+            .assertion(
+                &rp_id,
+                &client_data_hash,
+                flags,
+                first_verified,
+                &first,
+                total,
+            )
+            .await?;
+        if total.is_some() {
+            self.pending = Some(Pending {
+                rp_id,
+                client_data_hash,
+                // Base flags without UV; UV is applied per credential policy.
+                flags: flags & !FLAG_UV,
+                user_verified,
+                remaining: creds,
+                started_ms: now_ms,
+            });
+        }
+        Ok(out)
+    }
+
+    async fn get_next_assertion(&mut self, now_ms: u64) -> Result<Vec<u8>, Status> {
+        let mut p = self.pending.take().ok_or(Status::NotAllowed)?;
+        if now_ms.saturating_sub(p.started_ms) > NEXT_ASSERTION_TIMEOUT_MS || p.remaining.is_empty()
+        {
+            return Err(Status::NotAllowed);
+        }
+        let cred = p.remaining.remove(0);
+        let mut flags = p.flags & !FLAG_UV;
+        let uv = p.user_verified && cred.uv_policy.supports_uv();
+        if !cred.allows_assertion(false, uv) {
+            return Err(Status::NotAllowed);
+        }
+        if uv {
+            flags |= FLAG_UV;
+        }
+        let out = self
+            .assertion(&p.rp_id, &p.client_data_hash, flags, uv, &cred, None)
+            .await?;
+        if !p.remaining.is_empty() {
+            p.started_ms = now_ms;
+            self.pending = Some(p);
+        }
+        Ok(out)
+    }
+
+    async fn reset(&mut self) -> Result<(), Status> {
+        self.ask(PresenceKind::Reset, None, None, false).await?;
+        for c in self.store.clear().await.map_err(store_err)? {
+            let _ = self.backend.delete_key(&c.key_handle).await;
+        }
+        Ok(())
+    }
+}
+
+fn parse_params(params: &Bytes) -> Result<Value, Status> {
+    if params.is_empty() {
+        return Err(Status::MissingParameter);
+    }
+    let v = decode(params)?;
+    v.as_map()?;
+    Ok(v)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cbor::encode;
+    use crate::soft::{MemoryStore, ScriptedPresence, SoftBackend};
+    use crate::TestDrbg;
+    use futures::executor::block_on;
+
+    struct AsyncBackendWrapper(SoftBackend<TestDrbg>);
+
+    impl AsyncBackend for AsyncBackendWrapper {
+        async fn random(&mut self, out: &mut [u8]) {
+            futures::future::ready(()).await;
+            Backend::random(&mut self.0, out)
+        }
+
+        async fn create_key(
+            &mut self,
+            rp_id: &str,
+            user_id: &[u8],
+            uv: UvPolicy,
+        ) -> Result<NewKey, BackendError> {
+            futures::future::ready(()).await;
+            Backend::create_key(&mut self.0, rp_id, user_id, uv)
+        }
+
+        async fn sign(&mut self, handle: &[u8], message: &[u8]) -> Result<Vec<u8>, BackendError> {
+            futures::future::ready(()).await;
+            Backend::sign(&mut self.0, handle, message)
+        }
+
+        async fn delete_key(&mut self, handle: &[u8]) -> Result<(), BackendError> {
+            futures::future::ready(()).await;
+            Backend::delete_key(&mut self.0, handle)
+        }
+    }
+
+    struct AsyncStoreWrapper(MemoryStore);
+
+    impl AsyncCredentialStore for AsyncStoreWrapper {
+        async fn get(&self, id: &[u8]) -> Result<Option<Arc<Credential>>, StoreError> {
+            futures::future::ready(()).await;
+            CredentialStore::get(&self.0, id)
+        }
+
+        async fn list_rp(&self, rp_id: &str) -> Result<Vec<Arc<Credential>>, StoreError> {
+            futures::future::ready(()).await;
+            CredentialStore::list_rp(&self.0, rp_id)
+        }
+
+        async fn insert(&mut self, cred: Arc<Credential>) -> Result<(), StoreError> {
+            futures::future::ready(()).await;
+            CredentialStore::insert(&mut self.0, cred)
+        }
+
+        async fn remove(&mut self, id: &[u8]) -> Result<Option<Arc<Credential>>, StoreError> {
+            futures::future::ready(()).await;
+            CredentialStore::remove(&mut self.0, id)
+        }
+
+        async fn clear(&mut self) -> Result<Vec<Arc<Credential>>, StoreError> {
+            futures::future::ready(()).await;
+            CredentialStore::clear(&mut self.0)
+        }
+
+        async fn next_sign_count(&mut self) -> Result<u32, StoreError> {
+            futures::future::ready(()).await;
+            CredentialStore::next_sign_count(&mut self.0)
+        }
+    }
+
+    struct AsyncPresenceWrapper(ScriptedPresence);
+
+    impl AsyncUserPresence for AsyncPresenceWrapper {
+        async fn request(&mut self, req: &PresenceRequest) -> Result<Presence, PresenceError> {
+            futures::future::ready(()).await;
+            UserPresence::request(&mut self.0, req)
+        }
+    }
+
+    fn config() -> AuthenticatorConfig {
+        AuthenticatorConfig {
+            default_uv_policy: UvPolicy::None,
+            ..AuthenticatorConfig::default()
+        }
+    }
+
+    fn make_request() -> Bytes {
+        let cdh = [7u8; 32];
+        let params = encode(&Out::Map(vec![
+            (Out::Int(0x01), Out::Bytes(&cdh)),
+            (
+                Out::Int(0x02),
+                Out::Map(vec![(Out::Text("id"), Out::Text("example.com"))]),
+            ),
+            (
+                Out::Int(0x03),
+                Out::Map(vec![(Out::Text("id"), Out::Bytes(b"alice"))]),
+            ),
+            (
+                Out::Int(0x04),
+                Out::Array(vec![Out::Map(vec![
+                    (Out::Text("alg"), Out::Int(COSE_ALG_ES256)),
+                    (Out::Text("type"), Out::Text("public-key")),
+                ])]),
+            ),
+            (
+                Out::Int(0x07),
+                Out::Map(vec![(Out::Text("rk"), Out::Bool(true))]),
+            ),
+        ]));
+        let mut request = vec![command::MAKE_CREDENTIAL];
+        request.extend_from_slice(&params);
+        Bytes::copy_from_slice(&request)
+    }
+
+    fn assertion_request(id: &Bytes) -> Bytes {
+        let cdh = [9u8; 32];
+        let params = encode(&Out::Map(vec![
+            (Out::Int(0x01), Out::Text("example.com")),
+            (Out::Int(0x02), Out::Bytes(&cdh)),
+            (
+                Out::Int(0x03),
+                Out::Array(vec![Out::Map(vec![
+                    (Out::Text("id"), Out::Bytes(&id[..])),
+                    (Out::Text("type"), Out::Text("public-key")),
+                ])]),
+            ),
+        ]));
+        let mut request = vec![command::GET_ASSERTION];
+        request.extend_from_slice(&params);
+        Bytes::copy_from_slice(&request)
+    }
+
+    #[test]
+    fn sync_seams_work_through_async_authenticator() {
+        let mut auth = AsyncAuthenticator::new(
+            SoftBackend::new(TestDrbg::new([1u8; 32])),
+            MemoryStore::default(),
+            ScriptedPresence::approve(),
+            config(),
+        );
+
+        let response = block_on(auth.process(&make_request(), 0));
+        assert_eq!(response[0], Status::Ok.code());
+
+        let creds = block_on(AsyncCredentialStore::list_rp(auth.store(), "example.com")).unwrap();
+        let id = creds[0].id.clone();
+        let response = block_on(auth.process(&assertion_request(&id), 1));
+        assert_eq!(response[0], Status::Ok.code());
+    }
+
+    #[test]
+    fn genuinely_async_seams_work_through_async_authenticator() {
+        let mut auth = AsyncAuthenticator::new(
+            AsyncBackendWrapper(SoftBackend::new(TestDrbg::new([2u8; 32]))),
+            AsyncStoreWrapper(MemoryStore::default()),
+            AsyncPresenceWrapper(ScriptedPresence::approve()),
+            config(),
+        );
+
+        let response = block_on(auth.process(&make_request(), 0));
+        assert_eq!(response[0], Status::Ok.code());
+
+        let creds = block_on(AsyncCredentialStore::list_rp(auth.store(), "example.com")).unwrap();
+        let id = creds[0].id.clone();
+        let response = block_on(auth.process(&assertion_request(&id), 1));
+        assert_eq!(response[0], Status::Ok.code());
+        assert_eq!(auth.store().0.counter(), 2);
+    }
+}

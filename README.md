@@ -25,6 +25,23 @@ Requests are parsed zero copy: byte and text strings are ranges into the
 `Arc<[u8]>` request buffer, and loaded credentials are ranges into the
 decrypted store buffer.
 
+## Async API
+
+`se-fido-ctap2` also exposes `AsyncAuthenticator::process`, which mirrors the
+synchronous `Authenticator::process` but awaits `AsyncBackend`,
+`AsyncCredentialStore` and `AsyncUserPresence`. The synchronous API is
+unchanged; existing synchronous implementations satisfy the async traits
+through blanket adapters.
+
+Async backends and stores let embedded transports replace `block_on` flash or
+HMAC wrappers with real awaits. Because the adapters are blanket impls, a type
+that needs both APIs should wrap one side in a newtype. Async presence is
+optional: it is useful when the answer arrives through an event source, but a
+transport must still emit KEEPALIVE responses while that future is pending.
+Cancellation of an in-flight command is not part of this change.
+
+Run the async tests with `cargo test -p se-fido-ctap2`.
+
 ## What the authenticator advertises
 
 - versions `FIDO_2_0` and `FIDO_2_1`; extension `credProtect` (enforced; level 3
