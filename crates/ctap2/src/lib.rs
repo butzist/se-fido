@@ -8,8 +8,11 @@
 //! shared buffers.
 //!
 //! Keys, user presence and storage are behind [`Backend`], [`UserPresence`]
-//! and [`CredentialStore`]. [`soft`] has deterministic in-memory versions
-//! used by the fixtures.
+//! and [`CredentialStore`]. [`AsyncAuthenticator`] offers an additive async
+//! path through [`AsyncBackend`], [`AsyncUserPresence`] and
+//! [`AsyncCredentialStore`]; synchronous implementations work through blanket
+//! adapters. [`soft`] has deterministic in-memory versions used by the
+//! fixtures.
 //!
 //! `no_std` + `alloc`.
 
@@ -20,6 +23,7 @@ extern crate alloc;
 #[cfg(feature = "std")]
 extern crate std;
 
+mod async_authenticator;
 pub mod authdata;
 mod authenticator;
 mod bytes;
@@ -31,6 +35,7 @@ mod status;
 mod types;
 pub mod u2f;
 
+pub use async_authenticator::AsyncAuthenticator;
 pub use authenticator::{
     AttestationFormat, Authenticator, AuthenticatorConfig, NEXT_ASSERTION_TIMEOUT_MS,
 };

@@ -16,5 +16,8 @@ std = []
 p256 = { workspace = true, features = ["ecdsa"] }
 sha2.workspace = true
 
+[dev-dependencies]
+futures = "0.3"
+
 [lib]
 name = "ctap2"
